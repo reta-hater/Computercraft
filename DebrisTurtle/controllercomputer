@@ -1,1 +1,567 @@
+-- ============================================================
+--  NETHER MINER MASTER COMPUTER v4.0
+--  Multi-turtle swarm monitor & control
+--
+--  Requires:
+--    - Advanced Computer
+--    - Ender Modem attached to computer
+--    - 2x2 Advanced Monitor attached to computer
+-- ============================================================
 
+local CFG = {
+    channel     = 1337,
+    pingEvery   = 15,
+    timeout     = 45,
+    maxLog      = 6,
+    debug       = true,
+}
+
+-- ============================================================
+--  STATE
+-- ============================================================
+local turtles   = {}
+local eventLog  = {}
+local selected  = nil
+local sortedIDs = {}
+local view      = "list"   -- "list" | "detail"
+local actionButtonY = nil  -- exact Y row of action buttons, set during draw
+local actionButton2Y = nil -- exact Y row of second button row (AUTO)
+
+local modem   = nil
+local monitor = nil
+local running = true
+local lastPing = 0
+local W, H = 1, 1
+local myX, myZ = nil, nil
+
+local FACING = {[0]="N",[1]="E",[2]="S",[3]="W"}
+
+-- ============================================================
+--  LOGGING
+-- ============================================================
+local function addLog(msg)
+    local t = os.date("%H:%M")
+    table.insert(eventLog, 1, t.." "..msg)
+    if #eventLog > CFG.maxLog then table.remove(eventLog) end
+    if CFG.debug then print("[LOG] "..msg) end
+end
+
+-- ============================================================
+--  TURTLE DATA
+-- ============================================================
+local function defaultTurtle(id)
+    return {
+        id=id, online=false, lastSeen=0,
+        fuel=0, fuelMax=20000,
+        pos={x=0,y=0,z=0}, facing=0,
+        cycle=0, strips=0, debris=0,
+        state="unknown", sos=false, sosPos=nil,
+        pendingRecall=false,
+        debrisThreshold=0, scanRadius=8, stripLength=30,
+    }
+end
+
+local function getSortedIDs()
+    local ids={}
+    for id,_ in pairs(turtles) do ids[#ids+1]=id end
+    table.sort(ids, function(a,b)
+        return (turtles[a].debris or 0) > (turtles[b].debris or 0)
+    end)
+    return ids
+end
+
+local function checkTimeouts()
+    for id,t in pairs(turtles) do
+        if t.online and (os.clock()-t.lastSeen)>CFG.timeout then
+            t.online=false; t.state="offline"
+            addLog("#"..id.." timed out")
+        end
+    end
+end
+
+-- ============================================================
+--  MONITOR HELPERS
+-- ============================================================
+local function cls()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+end
+
+local function mAt(x,y,text,fg,bg)
+    if x<1 or y<1 or x>W or y>H then return end
+    monitor.setCursorPos(x,y)
+    if fg then monitor.setTextColor(fg) end
+    if bg then monitor.setBackgroundColor(bg) end
+    local room = W-x+1
+    if #text > room then text=text:sub(1,room) end
+    monitor.write(text)
+end
+
+local function mFill(y,fg,bg,char)
+    monitor.setCursorPos(1,y)
+    monitor.setTextColor(fg or colors.white)
+    monitor.setBackgroundColor(bg or colors.black)
+    monitor.write(string.rep(char or " ",W))
+end
+
+local function mBar(x,y,w,cur,max)
+    local pct = max>0 and math.min(cur/max,1) or 0
+    local filled = math.floor(w*pct)
+    local col = pct>0.5 and colors.green or (pct>0.2 and colors.yellow or colors.red)
+    monitor.setCursorPos(x,y)
+    monitor.setBackgroundColor(col)
+    monitor.write(string.rep(" ",filled))
+    monitor.setBackgroundColor(colors.gray)
+    monitor.write(string.rep(" ",w-filled))
+    monitor.setBackgroundColor(colors.black)
+end
+
+-- ============================================================
+--  VIEWS
+-- ============================================================
+local function drawHeader(title)
+    mFill(1, colors.black, colors.yellow)
+    mAt(2, 1, title, colors.black, colors.yellow)
+    local t=os.date("%H:%M")
+    mAt(W-#t, 1, t, colors.black, colors.yellow)
+end
+
+-- LIST VIEW — compact table of all turtles
+local function drawListView()
+    cls()
+    local total,online=0,0
+    for _,t in pairs(turtles) do
+        total=total+1
+        if t.online then online=online+1 end
+    end
+    drawHeader("SWARM "..online.."/"..total)
+
+    -- Column header
+    mFill(2, colors.lightGray, colors.gray)
+    mAt(2,  2, "ID",     colors.white, colors.gray)
+    mAt(8,  2, "State",  colors.white, colors.gray)
+    mAt(18, 2, "Deb",    colors.white, colors.gray)
+    mAt(23, 2, "Fuel",   colors.white, colors.gray)
+
+    sortedIDs = getSortedIDs()
+    for i,id in ipairs(sortedIDs) do
+        local y = i+2
+        if y>H then break end
+        local tt = turtles[id]
+        local bg = id==selected and colors.cyan or colors.black
+        local fg = colors.white
+
+        mFill(y, fg, bg)
+
+        -- Status dot
+        local dotC = tt.sos and colors.orange or (tt.online and colors.green or colors.red)
+        mAt(2, y, "●", dotC, bg)
+
+        -- ID (padded)
+        mAt(4, y, string.format("%-3s", tostring(id)), fg, bg)
+
+        -- State (truncated to 8)
+        local st = (tt.state or "?"):sub(1,8)
+        mAt(8, y, string.format("%-8s", st), tt.sos and colors.orange or colors.lightGray, bg)
+
+        -- Debris
+        mAt(18, y, string.format("%-4s", tostring(tt.debris)), colors.yellow, bg)
+
+        -- Fuel bar (remaining width)
+        local barW = W - 23
+        if barW > 2 then
+            local pct = tt.fuelMax>0 and math.min(tt.fuel/tt.fuelMax,1) or 0
+            local filled = math.floor(barW*pct)
+            local col = pct>0.5 and colors.green or (pct>0.2 and colors.yellow or colors.red)
+            monitor.setCursorPos(23,y)
+            monitor.setBackgroundColor(col)
+            monitor.write(string.rep("|",filled))
+            monitor.setBackgroundColor(colors.gray)
+            monitor.write(string.rep(".",barW-filled))
+            monitor.setBackgroundColor(bg)
+        end
+    end
+
+    -- Empty rows
+    for i=#sortedIDs+1, H-2 do
+        mFill(i+2, colors.white, colors.black)
+    end
+
+    -- Footer hint
+    mFill(H, colors.gray, colors.gray)
+    mAt(2, H, "Tap turtle to view", colors.white, colors.gray)
+end
+
+-- DETAIL VIEW — full info for selected turtle
+local function drawDetailView()
+    cls()
+    if not selected or not turtles[selected] then
+        view="list"; return
+    end
+    local tt = turtles[selected]
+
+    -- Header with back hint
+    mFill(1, colors.black, colors.yellow)
+    mAt(2, 1, "#"..selected.." "..(tt.state or "?"), colors.black, colors.yellow)
+    local statusStr = tt.online and (tt.sos and "SOS" or "OK") or "OFF"
+    local statusCol = tt.sos and colors.orange or (tt.online and colors.green or colors.red)
+    mAt(W-#statusStr, 1, statusStr, statusCol, colors.yellow)
+
+    local y=2
+
+    -- SOS banner
+    if tt.sos then
+        mFill(y, colors.white, colors.orange)
+        mAt(2, y, "!! CRIT FUEL !!", colors.white, colors.orange)
+        if tt.sosPos then
+            mAt(17, y, string.format("X%d Z%d", tt.sosPos.x, tt.sosPos.z), colors.white, colors.orange)
+        end
+        y=y+1
+    end
+
+    -- Fuel bar
+    mFill(y, colors.lightGray, colors.black)
+    mAt(2, y, string.format("Fuel %d/%d", tt.fuel, tt.fuelMax), colors.white, colors.black)
+    y=y+1
+    mBar(2, y, W-2, tt.fuel, tt.fuelMax)
+    y=y+1
+
+    -- Position
+    mFill(y, colors.white, colors.black)
+    mAt(2, y, string.format("X:%-6d Y:%-4d Z:%d", tt.pos.x, tt.pos.y, tt.pos.z), colors.white, colors.black)
+    y=y+1
+
+    -- Facing + distance
+    local info = "Facing: "..(FACING[tt.facing] or "?")
+    if myX and myZ then
+        local dist=math.floor(math.sqrt((tt.pos.x-myX)^2+(tt.pos.z-myZ)^2))
+        info=info.."  Dist:"..dist.."m"
+    end
+    mFill(y, colors.lightGray, colors.black)
+    mAt(2, y, info, colors.lightGray, colors.black)
+    y=y+1
+
+    -- Stats
+    mFill(y, colors.white, colors.black)
+    mAt(2, y, string.format("Debris:%-4d Strips:%-4d", tt.debris, tt.strips), colors.yellow, colors.black)
+    y=y+1
+    mFill(y, colors.white, colors.black)
+    mAt(2, y, "Cycle: "..tostring(tt.cycle), colors.lightGray, colors.black)
+    y=y+1
+
+    -- Divider
+    mFill(y, colors.gray, colors.gray)
+    mAt(2, y, "Actions", colors.white, colors.gray)
+    y=y+1
+
+    -- Action buttons row 1
+    actionButtonY = y  -- record exact row for click detection
+    local bw = math.floor((W-1)/4)
+    local btns = {
+        {label="RECALL", bg=colors.red,    x=1},
+        {label="PING",   bg=colors.blue,   x=1+bw},
+        {label="SCAN",   bg=colors.green,  x=1+bw*2},
+        {label="STRIP",  bg=colors.purple, x=1+bw*3},
+    }
+    for _,b in ipairs(btns) do
+        monitor.setCursorPos(b.x, y)
+        monitor.setBackgroundColor(b.bg)
+        monitor.setTextColor(colors.white)
+        local lbl = b.label
+        local pad = math.floor((bw-#lbl)/2)
+        monitor.write(string.rep(" ",pad)..lbl..string.rep(" ",bw-#lbl-pad))
+    end
+    monitor.setBackgroundColor(colors.black)
+    y=y+1
+
+    -- Action buttons row 2 — AUTO sets debris threshold for auto-recall
+    actionButton2Y = y
+    local bw2 = W - 1
+    local thresholdDisplay = (tt.debrisThreshold and tt.debrisThreshold > 0) and tt.debrisThreshold or "OFF"
+    local autoLabel = "AUTO-RECALL @ "..thresholdDisplay
+    monitor.setCursorPos(1, y)
+    monitor.setBackgroundColor(colors.orange)
+    monitor.setTextColor(colors.white)
+    local pad2 = math.floor((bw2-#autoLabel)/2)
+    monitor.write(string.rep(" ",math.max(0,pad2))..autoLabel..string.rep(" ",math.max(0,bw2-#autoLabel-pad2)))
+    monitor.setBackgroundColor(colors.black)
+    y=y+1
+
+    -- Log
+    mFill(y, colors.gray, colors.gray)
+    mAt(2, y, "Log", colors.white, colors.gray)
+    y=y+1
+
+    for _,entry in ipairs(eventLog) do
+        if y>H then break end
+        mFill(y, colors.lightGray, colors.black)
+        mAt(2, y, entry, colors.lightGray, colors.black)
+        y=y+1
+    end
+
+    -- Footer
+    mFill(H, colors.gray, colors.gray)
+    mAt(2, H, "Tap top-left to go back", colors.white, colors.gray)
+end
+
+local function redraw()
+    if view=="list" then
+        drawListView()
+    else
+        drawDetailView()
+    end
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+end
+
+-- ============================================================
+--  MODEM
+-- ============================================================
+local function findModem()
+    for _,side in ipairs({"left","right","top","bottom","front","back"}) do
+        local pt=peripheral.getType(side)
+        if pt=="modem" then
+            local m=peripheral.wrap(side)
+            if m.isWireless and m.isWireless() then
+                m.open(CFG.channel); addLog("Modem on "..side); return m
+            end
+        end
+    end
+    return nil
+end
+
+local function sendTo(id, data)
+    if not modem then return false end
+    data.target=id
+    modem.transmit(CFG.channel, CFG.channel, textutils.serialize(data))
+    return true
+end
+
+local function sendAll(data)
+    if not modem then return false end
+    modem.transmit(CFG.channel, CFG.channel, textutils.serialize(data))
+    return true
+end
+
+-- ============================================================
+--  MESSAGE HANDLING
+-- ============================================================
+local function handleMessage(msg)
+    local ok,data=pcall(textutils.unserialize,msg)
+    if not ok or type(data)~="table" then return end
+    local id=data.id
+    if not id then return end
+
+    if not turtles[id] then
+        turtles[id]=defaultTurtle(id)
+        addLog("New turtle #"..id)
+        if not selected then selected=id end
+    end
+
+    local tt=turtles[id]
+    if data.type=="status" or data.type=="sos" then
+        local wasOnline=tt.online
+        tt.online=true; tt.lastSeen=os.clock()
+        tt.fuel   =data.fuel    or 0
+        tt.fuelMax=data.fuelMax or 20000
+        tt.pos    =data.pos     or tt.pos
+        tt.facing =data.facing  or 0
+        tt.cycle  =data.cycle   or 0
+        tt.strips =data.strips  or 0
+        tt.debris =data.debris  or 0
+        tt.state  =data.state   or "mining"
+        -- Real reported config values — always trust what the turtle says
+        -- over anything the master remembers locally, since the turtle is
+        -- the source of truth and the master may have restarted.
+        if data.debrisThreshold ~= nil then tt.debrisThreshold = data.debrisThreshold end
+        if data.scanRadius      ~= nil then tt.scanRadius      = data.scanRadius end
+        if data.stripLength     ~= nil then tt.stripLength     = data.stripLength end
+        if not wasOnline then addLog("#"..id.." online") end
+
+        -- Confirm recall actually landed — stop retransmitting once the
+        -- turtle's own status proves it got the message
+        if tt.pendingRecall and (tt.state=="recalling" or tt.state=="recalled") then
+            tt.pendingRecall=false
+            addLog("Recall confirmed by #"..id)
+        end
+
+        if data.type=="sos" then
+            tt.sos=true; tt.sosPos=data.pos
+            addLog("!! SOS #"..id.." fuel="..tostring(data.fuel))
+        elseif tt.sos and tt.fuel>500 then
+            tt.sos=false; addLog("SOS cleared #"..id)
+        end
+    end
+end
+
+-- ============================================================
+--  INPUT
+-- ============================================================
+local function handleTouch(mx, my)
+    if view=="list" then
+        -- Tap a turtle row to select and switch to detail
+        local row=my-2
+        if row>=1 and row<=#sortedIDs then
+            local id=sortedIDs[row]
+            if id then
+                selected=id
+                view="detail"
+            end
+        end
+    else
+        -- In detail view
+        -- Tap top-left corner (x<=4, y==1) to go back
+        if my==1 and mx<=4 then
+            view="list"; return
+        end
+
+        -- Action buttons — use the exact row recorded during drawDetailView
+        local tt=turtles[selected]
+        if not tt then view="list"; return end
+
+        local bw=math.floor((W-1)/4)
+
+        if actionButtonY and my==actionButtonY then
+            local bIdx=math.floor((mx-1)/bw)+1
+            if bIdx==1 then
+                -- Mark this turtle as having a pending recall — the main
+                -- loop will keep retransmitting it on every ping cycle
+                -- until the turtle's own status confirms it's recalling
+                -- or recalled, since a single send can miss the turtle's
+                -- listen window.
+                local tt = turtles[selected]
+                if tt then tt.pendingRecall = true end
+                sendTo(selected,{cmd="recall"})
+                addLog("Recall → #"..selected.." (will retry until confirmed)")
+            elseif bIdx==2 then
+                sendTo(selected,{cmd="ping"})
+                addLog("Ping → #"..selected)
+            elseif bIdx==3 then
+                inputMode="scan_radius"
+                inputBuf=""
+                print("Enter scan radius for #"..selected..":")
+            elseif bIdx==4 then
+                inputMode="strip_length"
+                inputBuf=""
+                print("Enter strip length for #"..selected..":")
+            end
+        elseif actionButton2Y and my==actionButton2Y then
+            inputMode="debris_threshold"
+            inputBuf=""
+            print("Enter debris threshold for #"..selected.." (0 = off):")
+        end
+    end
+end
+
+local function handleKey(key)
+    if not inputMode then return end
+    if key==keys.enter then
+        local val=tonumber(inputBuf)
+        if val and val>=0 then
+            if inputMode=="scan_radius" then
+                sendTo(selected,{cmd="config",scanRadius=val})
+                addLog("ScanR "..val.." → #"..selected)
+            elseif inputMode=="strip_length" then
+                sendTo(selected,{cmd="config",stripLength=val})
+                addLog("StripL "..val.." → #"..selected)
+            elseif inputMode=="debris_threshold" then
+                sendTo(selected,{cmd="config",debrisThreshold=val})
+                addLog("Threshold "..val.." → #"..selected)
+                -- The button label will update automatically once the
+                -- turtle's next status broadcast confirms the real value,
+                -- rather than guessing at it locally here.
+            end
+        else print("Cancelled.") end
+        inputMode=nil; inputBuf=""
+    elseif key==keys.backspace then
+        inputBuf=inputBuf:sub(1,-2)
+        io.write("\r"..inputBuf.."   \r"..inputBuf)
+    else
+        local char=keys.getName(key)
+        if char and #char==1 and char:match("%d") then
+            inputBuf=inputBuf..char; io.write(char)
+        end
+    end
+end
+
+-- ============================================================
+--  MAIN
+-- ============================================================
+local function run()
+    -- Find monitor
+    monitor=nil
+    for _,side in ipairs({"left","right","top","bottom","front","back"}) do
+        if peripheral.getType(side)=="monitor" then
+            monitor=peripheral.wrap(side); break
+        end
+    end
+    if not monitor then print("ERROR: No monitor found!"); return end
+
+    monitor.setTextScale(0.5)
+    W,H=monitor.getSize()
+    print("Monitor: "..W.."x"..H)
+
+    -- Find modem
+    modem=findModem()
+    if not modem then
+        monitor.clear()
+        monitor.setCursorPos(1,1)
+        monitor.write("No ender modem!")
+        sleep(5); return
+    end
+
+    -- Get own GPS
+    local gx,_,gz=gps.locate(5)
+    if gx then
+        myX=math.floor(gx+0.5)
+        myZ=math.floor(gz+0.5)
+        addLog("GPS: "..myX..",_,"..myZ)
+    else
+        addLog("No GPS fix")
+    end
+
+    addLog("Master online ch."..CFG.channel)
+    redraw()
+
+    while running do
+        if os.clock()-lastPing>CFG.pingEvery then
+            sendAll({cmd="ping"})
+            -- Retransmit any unconfirmed recalls — a single send can miss
+            -- the turtle's brief listen window, so keep nudging it every
+            -- ping cycle until its status confirms the recall landed.
+            for id,tt in pairs(turtles) do
+                if tt.pendingRecall then
+                    sendTo(id,{cmd="recall"})
+                    addLog("Recall retry → #"..id)
+                end
+            end
+            lastPing=os.clock()
+        end
+        checkTimeouts()
+        redraw()
+
+        local timer=os.startTimer(1)
+        local looping=true
+        while looping do
+            local ev,p1,p2,p3,p4=os.pullEvent()
+            if ev=="modem_message" then
+                -- side, channel, replyChannel, message, distance
+                if p2==CFG.channel then
+                    handleMessage(p4); looping=false
+                end
+            elseif ev=="monitor_touch" then
+                handleTouch(p2,p3); looping=false
+            elseif ev=="key" then
+                handleKey(p1); looping=false
+            elseif ev=="timer" and p1==timer then
+                looping=false
+            end
+        end
+    end
+
+    monitor.clear()
+    if modem then modem.close(CFG.channel) end
+end
+
+local ok,e=pcall(run)
+if not ok then print("FATAL: "..tostring(e)) end
