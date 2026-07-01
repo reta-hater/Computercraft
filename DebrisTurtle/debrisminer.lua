@@ -130,9 +130,9 @@ local function gpsSync()
 end
 
 -- ============================================================
---  SAFE MOVEMENT  (every move is GPS-verified, no dead reckoning)
+--  SAFE MOVEMENT  (dead reckoning during movement, GPS sync at decision points)
 -- ============================================================
-local function digAndMove(moveFn, digFn)
+local function digAndMove(moveFn, digFn, trackFn)
     local tries=0
     while not moveFn() do
         tries=tries+1
@@ -140,7 +140,7 @@ local function digAndMove(moveFn, digFn)
             err("Stuck x10 — forcing pickaxe re-equip")
             equipPickaxe(); sleep(0.5)
             if moveFn() then
-                gpsSync()
+                trackFn()
                 State.blocksSinceRescan=State.blocksSinceRescan+1
                 return true
             end
@@ -148,18 +148,25 @@ local function digAndMove(moveFn, digFn)
         end
         digFn(); sleep(0.3)
     end
-    gpsSync()  -- always confirm real position after a successful move
+    trackFn()  -- dead reckoning — fast, no modem swap needed per block
     State.blocksSinceRescan=State.blocksSinceRescan+1
     return true
 end
 
-local function moveForward() return digAndMove(turtle.forward, turtle.dig)    end
-local function moveUp()      return digAndMove(turtle.up,      turtle.digUp)   end
-local function moveDown()    return digAndMove(turtle.down,    turtle.digDown) end
+local function moveForward()
+    return digAndMove(turtle.forward, turtle.dig,
+        function() State.x=State.x+DIR[State.facing].x; State.z=State.z+DIR[State.facing].z end)
+end
+local function moveUp()
+    return digAndMove(turtle.up, turtle.digUp, function() State.y=State.y+1 end)
+end
+local function moveDown()
+    return digAndMove(turtle.down, turtle.digDown, function() State.y=State.y-1 end)
+end
 
--- Navigate to an absolute world position. Re-derives the remaining delta
--- from a fresh GPS reading before every leg, so any drift self-corrects
--- instead of compounding.
+-- Navigate to an absolute world position using dead reckoning during movement.
+-- Syncs GPS at the start of each axis leg so any drift is corrected before
+-- computing the next leg's delta — accurate without syncing on every block.
 local function navTo(tx, ty, tz)
     gpsSync()
     local dy=ty-State.y
@@ -446,7 +453,6 @@ saveState = function()
     local f=fs.open(SAVE_FILE,"w")
     if not f then err("Cannot save state"); return end
     f.write(textutils.serialize({
-        facing          = State.facing,
         stripCount      = State.stripCount,
         stripDir        = State.stripDir,
         scanRadius      = CFG.scanRadius,
@@ -465,17 +471,14 @@ local function loadState()
     local ok,d=pcall(textutils.unserialize, f.readAll())
     f.close()
     if not ok or type(d)~="table" then err("Corrupt save file — ignoring"); return false end
-    State.facing     = d.facing     or 0
     State.stripCount = d.stripCount or 0
     State.stripDir   = d.stripDir   or 1
-    -- Restore remote-configurable settings if previously changed
     if d.scanRadius      then CFG.scanRadius      = d.scanRadius end
     if d.stripLength     then CFG.stripLength     = d.stripLength end
     if d.debrisThreshold then CFG.debrisThreshold = d.debrisThreshold end
-    -- Restore recall intent — survives a shutdown mid-journey home
     State.recallRequested = d.recallRequested or false
     State.recalled         = d.recalled        or false
-    log("Loaded: facing="..DNAME[State.facing].." strip="..State.stripCount
+    log("Loaded: strip="..State.stripCount
         ..(State.recallRequested and " [RECALL PENDING]" or "")
         ..(State.recalled and " [SOFTLOCKED AT HOME]" or ""))
     return true
@@ -884,12 +887,16 @@ local function mainLoop()
     log("GPS: "..State.x..","..State.y..","..State.z)
     equipPickaxe()
 
-    -- Load saved state or calibrate fresh
+    -- Always calibrate facing via GPS on every startup — no need to save it
+    -- since we can derive it reliably from a quick forward move + GPS compare
+    log("Calibrating facing...")
+    calibrateFacing()
+
+    -- Load saved state (config values, recall intent, strip progress)
     if loadState() then
-        log("Resumed from save — facing="..DNAME[State.facing])
+        log("State loaded: strip="..State.stripCount)
     else
-        log("First run — calibrating facing...")
-        calibrateFacing()
+        log("No save file — fresh start")
         saveState()
     end
 
@@ -979,7 +986,8 @@ local function mainLoop()
         mineStrip()
         if State.recallRequested then doRecall(); return end  -- mineStrip may have detected recall mid-strip
         moveToNextStrip()
-        saveState()  -- persist facing + strip progress (position itself is always live via GPS)
+        gpsSync()    -- correct any dead reckoning drift after each strip
+        saveState()  -- persist facing + strip progress
 
         sleep(0.05)
     end
