@@ -329,10 +329,26 @@ local function getFuelMax()
 end
 
 local function openModem()
-    if not equipModem() then return nil end
-    local m=peripheral.find("modem")
-    if not m then err("No modem peripheral after equip"); return nil end
-    m.open(CFG.channel)
+    if not equipModem() then
+        err("openModem: equipModem() failed")
+        return nil
+    end
+    -- Use peripheral.wrap("right") directly — peripheral.find("modem") can
+    -- miss wireless/ender modems in some CC:Tweaked + AP version combinations
+    local m = peripheral.wrap("right")
+    if not m then
+        err("openModem: peripheral.wrap('right') returned nil (type="..tostring(peripheral.getType("right"))..")")
+        return nil
+    end
+    if not m.isOpen then
+        err("openModem: right peripheral is not a modem (type="..tostring(peripheral.getType("right"))..")")
+        return nil
+    end
+    local ok, openErr = pcall(function() m.open(CFG.channel) end)
+    if not ok then
+        err("openModem: m.open() failed: "..tostring(openErr))
+        return nil
+    end
     return m
 end
 
@@ -357,10 +373,20 @@ local function statusPacket(ptype, extra)
 end
 
 local function broadcastStatus()
-    local m=openModem(); if not m then return end
-    m.transmit(CFG.channel, CFG.channel, textutils.serialize(statusPacket("status")))
+    local m=openModem()
+    if not m then
+        err("broadcastStatus: openModem returned nil — cannot send")
+        return
+    end
+    local ok, transmitErr = pcall(function()
+        m.transmit(CFG.channel, CFG.channel, textutils.serialize(statusPacket("status")))
+    end)
+    if not ok then
+        err("broadcastStatus: transmit failed: "..tostring(transmitErr))
+    else
+        log("Status sent")
+    end
     m.close(CFG.channel)
-    log("Status sent")
 end
 
 local function broadcastSOS()
