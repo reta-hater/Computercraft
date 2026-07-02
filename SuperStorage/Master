@@ -1,0 +1,1439 @@
+local WHITELIST = {
+    "Z_DDM",
+    "silliestable",
+    "GTCEu",
+    "TheGoblinWhitgu"
+}
+
+
+local MODEM_SIDE = "back"          -- wireless ender modem side
+local SERVER_HOSTNAME = "storage_server"
+local BUFFER_DIRECTION = "back"    -- side the buffer barrel is on relative to each inventory manager
+
+local MANAGER_BUFFERS = {
+    inventory_manager_3 = "sophisticatedstorage:barrel_32",
+    inventory_manager_4 = "sophisticatedstorage:barrel_33",
+    inventory_manager_5 = "sophisticatedstorage:barrel_34",
+    inventory_manager_6 = "minecraft:barrel_0",
+}
+
+rednet.open(MODEM_SIDE)
+rednet.host("storage", SERVER_HOSTNAME)
+
+local chatBox = peripheral.find("chat_box")
+
+local bufferBarrelNames = {}
+for _, bufferName in pairs(MANAGER_BUFFERS) do
+    bufferBarrelNames[bufferName] = true
+end
+
+local READONLY_TYPES = {
+    ["minecraft:chest"] = true,
+    ["sophisticatedstorage:chest"] = true,
+    ["quark:variant_chest"] = true,
+}
+
+local EXCLUDED_TYPES = {
+    ["create:mechanical_belt"] = true,
+}
+
+local barrels = {}
+
+local function rebuildBarrelList()
+    local newBarrels = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        local types = { peripheral.getType(name) }
+        local hasInventory = false
+        local isManager = false
+        local isReadOnly = false
+        local isExcluded = false
+        for _, t in ipairs(types) do
+            if t == "inventory" then hasInventory = true end
+            if t == "inventory_manager" then isManager = true end
+            if READONLY_TYPES[t] then isReadOnly = true end
+            if EXCLUDED_TYPES[t] then isExcluded = true end
+        end
+        if hasInventory and not isManager and not bufferBarrelNames[name] and not isExcluded then
+            table.insert(newBarrels, { name = name, p = peripheral.wrap(name), readOnly = isReadOnly })
+        end
+    end
+    barrels = newBarrels
+end
+
+rebuildBarrelList()
+
+local writableCount, readOnlyCount = 0, 0
+for _, b in ipairs(barrels) do
+    if b.readOnly then readOnlyCount = readOnlyCount + 1 else writableCount = writableCount + 1 end
+end
+print("Barrels found: " .. writableCount .. " writable, " .. readOnlyCount .. " output-only")
+print("Chat box: " .. (chatBox and "yes" or "no"))
+print("Building inventory cache...")
+
+local ACTIVE_BARREL_FILE = "active_deposit_barrel.txt"
+local activeBarrelName = nil
+
+local function saveActiveBarrel(name)
+    local file = fs.open(ACTIVE_BARREL_FILE, "w")
+    if file then
+        file.write(name or "")
+        file.close()
+    end
+end
+
+local function loadActiveBarrel()
+    if fs.exists(ACTIVE_BARREL_FILE) then
+        local file = fs.open(ACTIVE_BARREL_FILE, "r")
+        local saved = file.readAll()
+        file.close()
+        if saved and saved ~= "" then
+            for _, b in ipairs(barrels) do
+                if b.name == saved and not b.readOnly then
+                    return saved
+                end
+            end
+        end
+    end
+    return nil
+end
+
+activeBarrelName = loadActiveBarrel()
+if activeBarrelName then
+    print("Active deposit barrel (loaded): " .. activeBarrelName)
+else
+    print("Active deposit barrel: none saved yet, will pick one on first deposit.")
+end
+
+local function getBarrelFreeSpace(barrel)
+    local ok, items = pcall(barrel.p.list)
+    local ok2, size = pcall(barrel.p.size)
+    if not ok2 or not size then return 0 end
+    if not ok or not items then return 0 end
+
+    local usedSlots = 0
+    for _ in pairs(items) do
+        usedSlots = usedSlots + 1
+    end
+    local emptySlots = size - usedSlots
+    return emptySlots * 64
+end
+
+local function pickNewActiveBarrel(excludeName)
+    local best = nil
+    local bestSpace = -1
+    for _, b in ipairs(barrels) do
+        if not b.readOnly and b.name ~= excludeName then
+            local space = getBarrelFreeSpace(b)
+            if space > bestSpace then
+                bestSpace = space
+                best = b.name
+            end
+        end
+    end
+    return best
+end
+
+local function addLog(msg)
+    local t = os.time()
+    local h = math.floor(t / 3600) % 24
+    local m = math.floor(t / 60) % 60
+    print(string.format("[%02d:%02d] %s", h, m, msg))
+end
+
+local function sendChat(player, msg)
+    if chatBox then
+        chatBox.sendMessageToPlayer(msg, player, "Storage")
+    end
+end
+
+local function isWhitelisted(player)
+    for _, name in ipairs(WHITELIST) do
+        if name:lower() == player:lower() then
+            return true
+        end
+    end
+    return false
+end
+
+local playerManagerMap = {}
+
+local function buildManagerMap()
+    playerManagerMap = {}
+
+    for mgrName, bufferName in pairs(MANAGER_BUFFERS) do
+        if peripheral.isPresent(mgrName) then
+            local mgr = peripheral.wrap(mgrName)
+            local owner = mgr.getOwner and mgr.getOwner() or nil
+            if owner then
+                playerManagerMap[owner:lower()] = { mgr = mgr, name = mgrName, bufferName = bufferName }
+                print("  " .. owner .. " -> " .. mgrName .. " (buffer: " .. bufferName .. ")")
+            end
+        else
+            print("  [!] " .. mgrName .. " not found on network!")
+        end
+    end
+end
+
+buildManagerMap()
+
+local function getManagerEntry(player)
+    local key = player:lower()
+    local entry = playerManagerMap[key]
+    if not entry then
+        buildManagerMap()
+        entry = playerManagerMap[key]
+    end
+    return entry
+end
+
+local function formatEnchants(detail)
+    if not detail or not detail.enchantments or #detail.enchantments == 0 then
+        return nil
+    end
+    local parts = {}
+    for _, ench in ipairs(detail.enchantments) do
+        table.insert(parts, ench.displayName or (ench.name .. " " .. tostring(ench.level)))
+    end
+    return table.concat(parts, ", ")
+end
+
+local function formatPotionEffects(detail)
+    if not detail or not detail.potionEffects or #detail.potionEffects == 0 then
+        return nil
+    end
+    local parts = {}
+    for _, eff in ipairs(detail.potionEffects) do
+        local label = eff.displayName or eff.name
+        if eff.duration then
+            local mins = math.floor(eff.duration / 60)
+            local secs = math.floor(eff.duration % 60)
+            label = label .. string.format(" (%d:%02d)", mins, secs)
+        end
+        table.insert(parts, label)
+    end
+    return table.concat(parts, ", ")
+end
+
+local cache = {}
+local knownItemsCache = nil
+
+local function refreshBarrelCache(barrel)
+    local ok, items = pcall(barrel.p.list)
+    if ok and items then
+        cache[barrel.name] = items
+    else
+        cache[barrel.name] = {}
+    end
+    knownItemsCache = nil
+end
+
+local function rebuildCache()
+    local stillValid = {}
+    for _, barrel in ipairs(barrels) do
+        refreshBarrelCache(barrel)
+        stillValid[barrel.name] = true
+    end
+    for barrelName in pairs(cache) do
+        if not stillValid[barrelName] then
+            cache[barrelName] = nil
+        end
+    end
+    knownItemsCache = nil
+end
+
+local function forEachCachedItem(callback)
+    for barrelName, slots in pairs(cache) do
+        for slot, item in pairs(slots) do
+            callback(barrelName, slot, item)
+        end
+    end
+end
+
+local function getKnownItems()
+    if knownItemsCache then
+        return knownItemsCache
+    end
+    local seen = {}
+    local known = {}
+    forEachCachedItem(function(barrelName, slot, item)
+        if not seen[item.name] then
+            seen[item.name] = true
+            table.insert(known, { name = item.name, displayName = item.displayName })
+        end
+    end)
+    knownItemsCache = known
+    return known
+end
+
+local function resolveItemName(query)
+    if not query or query == "" then return {} end
+    local q = query:lower()
+    local known = getKnownItems()
+
+    for _, item in ipairs(known) do
+        if item.name:lower() == q then
+            return { item }
+        end
+    end
+
+    local shortMatches = {}
+    for _, item in ipairs(known) do
+        local shortId = item.name:match(":(.+)$") or item.name
+        if shortId:lower() == q then
+            table.insert(shortMatches, item)
+        end
+    end
+    if #shortMatches == 1 then return shortMatches end
+    if #shortMatches > 1 then return shortMatches end
+
+    local displayMatches = {}
+    for _, item in ipairs(known) do
+        if item.displayName and item.displayName:lower() == q then
+            table.insert(displayMatches, item)
+        end
+    end
+    if #displayMatches >= 1 then return displayMatches end
+
+    local partialMatches = {}
+    for _, item in ipairs(known) do
+        local shortId = (item.name:match(":(.+)$") or item.name):lower()
+        local display = item.displayName and item.displayName:lower() or ""
+        if shortId:find(q, 1, true) or display:find(q, 1, true) then
+            table.insert(partialMatches, item)
+        end
+    end
+
+    if #partialMatches > 1 then
+        local PRIORITY_SUFFIXES = { "_ingot", "_gem", "_dust", "_crystal", "_nugget", "_plate", "_rod" }
+        local prioritized = {}
+        for _, item in ipairs(partialMatches) do
+            local shortId = (item.name:match(":(.+)$") or item.name):lower()
+            for _, suffix in ipairs(PRIORITY_SUFFIXES) do
+                if shortId:find(q .. suffix .. "$") then
+                    table.insert(prioritized, item)
+                    break
+                end
+            end
+        end
+        if #prioritized == 1 then return prioritized end
+    end
+
+    return partialMatches
+end
+
+local enchantCache = {}
+
+local function getItemDetailSafe(barrel, slot)
+    local result = nil
+    local done = false
+
+    local function caller()
+        local ok, detail = pcall(barrel.p.getItemDetail, slot)
+        if ok then result = detail end
+        done = true
+    end
+
+    local function watchdog()
+        local timer = os.startTimer(2) -- 2 second hard cap
+        while not done do
+            local event, id = os.pullEvent("timer")
+            if id == timer then
+                return
+            end
+        end
+    end
+
+    parallel.waitForAny(caller, watchdog)
+    return done and result ~= nil, result
+end
+
+local function getStock()
+    local stock = {}
+    forEachCachedItem(function(barrelName, slot, item)
+        local key = item.name .. "|" .. tostring(item.nbt or "")
+        if stock[key] then
+            stock[key].count = stock[key].count + item.count
+        else
+            local entry = {
+                name = item.name,
+                nbt = item.nbt,
+                count = item.count,
+                displayName = item.displayName,
+                enchants = nil,
+            }
+            if item.nbt then
+                if enchantCache[key] ~= nil then
+                    entry.enchants = enchantCache[key] or nil
+                else
+                    local barrel = nil
+                    for _, b in ipairs(barrels) do
+                        if b.name == barrelName then barrel = b; break end
+                    end
+                    if barrel then
+                        local detailOk, detail = getItemDetailSafe(barrel, slot)
+                        if detailOk and detail then
+                            entry.displayName = detail.displayName or entry.displayName
+                            entry.enchants = formatEnchants(detail)
+                        end
+                    end
+                    enchantCache[key] = entry.enchants or false
+                end
+            end
+            stock[key] = entry
+        end
+    end)
+    local result = {}
+    for _, v in pairs(stock) do
+        table.insert(result, v)
+    end
+    table.sort(result, function(a, b)
+        local nameA = (a.displayName or a.name):lower()
+        local nameB = (b.displayName or b.name):lower()
+        if nameA == nameB then
+            return (a.enchants or "") < (b.enchants or "")
+        end
+        return nameA < nameB
+    end)
+    return result
+end
+
+local function getBufferContents(bufferName)
+    local buffer = peripheral.wrap(bufferName)
+    if not buffer then return {} end
+    local ok, items = pcall(buffer.list)
+    if not ok or not items then return {} end
+    return items, buffer
+end
+
+local function countItemInBuffer(bufferName, itemName)
+    local items = getBufferContents(bufferName)
+    local total = 0
+    for _, item in pairs(items) do
+        if item.name == itemName then
+            total = total + item.count
+        end
+    end
+    return total
+end
+
+local function pushToWritableStorage(bufferName, amount)
+    local remaining = amount
+
+    local bufferPeripheral = peripheral.wrap(bufferName)
+    if not bufferPeripheral then return 0 end
+    local ok, bufferItems = pcall(bufferPeripheral.list)
+    if not ok or not bufferItems then return 0 end
+
+    if not activeBarrelName then
+        activeBarrelName = pickNewActiveBarrel(nil)
+        saveActiveBarrel(activeBarrelName)
+    end
+
+    for bufferSlot in pairs(bufferItems) do
+        if remaining <= 0 then break end
+
+        if activeBarrelName then
+            local activeBarrel = nil
+            for _, b in ipairs(barrels) do
+                if b.name == activeBarrelName then activeBarrel = b; break end
+            end
+            if activeBarrel and not activeBarrel.readOnly then
+                local beforeRemaining = remaining
+                local pullOk, moved = pcall(activeBarrel.p.pullItems, bufferName, bufferSlot, remaining)
+                if pullOk and moved and moved > 0 then
+                    remaining = remaining - moved
+                    refreshBarrelCache(activeBarrel)
+                end
+                local slotMoved = beforeRemaining - remaining
+                local slotItem = bufferItems[bufferSlot]
+                local slotCount = slotItem and slotItem.count or 0
+                if slotMoved > 0 and slotMoved < slotCount and remaining > 0 then
+                    local newBarrel = pickNewActiveBarrel(activeBarrelName)
+                    if newBarrel and newBarrel ~= activeBarrelName then
+                        addLog("Active deposit barrel full, switching to " .. newBarrel)
+                        activeBarrelName = newBarrel
+                        saveActiveBarrel(activeBarrelName)
+                    end
+                end
+            end
+        end
+
+        if remaining > 0 then
+            for _, barrel in ipairs(barrels) do
+                if remaining <= 0 then break end
+                if not barrel.readOnly and barrel.name ~= activeBarrelName then
+                    local pullOk, moved = pcall(barrel.p.pullItems, bufferName, bufferSlot, remaining)
+                    if pullOk and moved and moved > 0 then
+                        remaining = remaining - moved
+                        refreshBarrelCache(barrel)
+                    end
+                end
+            end
+        end
+    end
+
+    return amount - remaining
+end
+
+local function findItemInBarrels(itemName, nbt)
+    local found = {}
+    forEachCachedItem(function(barrelName, slot, item)
+        if item.name == itemName and (nbt == nil or item.nbt == nbt) then
+            local readOnly = false
+            for _, b in ipairs(barrels) do
+                if b.name == barrelName then readOnly = b.readOnly; break end
+            end
+            table.insert(found, { barrelName = barrelName, slot = slot, count = item.count, nbt = item.nbt, readOnly = readOnly })
+        end
+    end)
+    table.sort(found, function(a, b)
+        if a.readOnly == b.readOnly then return false end
+        return not a.readOnly
+    end)
+    return found
+end
+
+local function findItemVariants(itemName)
+    local variants = {}
+    forEachCachedItem(function(barrelName, slot, item)
+        if item.name == itemName then
+            local key = tostring(item.nbt or "")
+            if not variants[key] then
+                local enchants = nil
+                if item.nbt then
+                    local cacheKey = item.name .. "|" .. key
+                    if enchantCache[cacheKey] ~= nil then
+                        enchants = enchantCache[cacheKey] or nil
+                    else
+                        local barrel = nil
+                        for _, b in ipairs(barrels) do
+                            if b.name == barrelName then barrel = b; break end
+                        end
+                        if barrel then
+                            local detailOk, detail = getItemDetailSafe(barrel, slot)
+                            if detailOk and detail then
+                                enchants = formatEnchants(detail)
+                            end
+                        end
+                        enchantCache[cacheKey] = enchants or false
+                    end
+                end
+                variants[key] = { nbt = item.nbt, count = 0, enchants = enchants }
+            end
+            variants[key].count = variants[key].count + item.count
+        end
+    end)
+    local result = {}
+    for _, v in pairs(variants) do
+        table.insert(result, v)
+    end
+    return result
+end
+
+local function resolvePlayerItemName(mgr, query)
+    if not query or query == "" then return {} end
+    local q = query:lower()
+
+    local ok, items = pcall(mgr.getItems)
+    if not ok or not items then return {} end
+
+    local seen = {}
+    local known = {}
+    for _, item in pairs(items) do
+        if not seen[item.name] then
+            seen[item.name] = true
+            table.insert(known, { name = item.name, displayName = item.displayName })
+        end
+    end
+
+    for _, item in ipairs(known) do
+        if item.name:lower() == q then return { item } end
+    end
+
+    local shortMatches = {}
+    for _, item in ipairs(known) do
+        local shortId = item.name:match(":(.+)$") or item.name
+        if shortId:lower() == q then table.insert(shortMatches, item) end
+    end
+    if #shortMatches >= 1 then return shortMatches end
+
+    local displayMatches = {}
+    for _, item in ipairs(known) do
+        if item.displayName and item.displayName:lower() == q then
+            table.insert(displayMatches, item)
+        end
+    end
+    if #displayMatches >= 1 then return displayMatches end
+
+    local partialMatches = {}
+    for _, item in ipairs(known) do
+        local shortId = (item.name:match(":(.+)$") or item.name):lower()
+        local display = item.displayName and item.displayName:lower() or ""
+        if shortId:find(q, 1, true) or display:find(q, 1, true) then
+            table.insert(partialMatches, item)
+        end
+    end
+    return partialMatches
+end
+
+local function depositItem(player, itemName, count)
+    local entry = getManagerEntry(player)
+    if not entry then
+        return false, "No memory card found for " .. player
+    end
+    if type(count) ~= "number" or count < 0 then
+        return false, "Invalid count."
+    end
+    local mgr = entry.mgr
+    local bufferName = entry.bufferName
+
+    local matches = resolvePlayerItemName(mgr, itemName)
+    if #matches == 0 then
+        return false, "Could not find '" .. itemName .. "' in your inventory"
+    end
+    if #matches > 1 then
+        local names = {}
+        for _, m in ipairs(matches) do
+            table.insert(names, m.displayName or m.name)
+        end
+        return false, "Multiple matches: " .. table.concat(names, ", ") .. ". Be more specific."
+    end
+    local resolvedName = matches[1].name
+
+    local toRemove = (count == 0) and 64 or count
+
+    local removed = mgr.removeItemFromPlayer(BUFFER_DIRECTION, { name = resolvedName, count = toRemove })
+    if not removed or removed == 0 then
+        return false, "Could not find " .. resolvedName .. " in your inventory"
+    end
+
+    local inBuffer = countItemInBuffer(bufferName, resolvedName)
+    if inBuffer < removed then
+        removed = inBuffer
+    end
+    if removed == 0 then
+        return false, "Item did not arrive in buffer barrel"
+    end
+
+    local moved = pushToWritableStorage(bufferName, removed)
+    local remaining = removed - moved
+
+    if remaining > 0 then
+        mgr.addItemToPlayer(BUFFER_DIRECTION, { name = resolvedName, count = remaining })
+        local stored = removed - remaining
+        if stored == 0 then
+            return false, "Storage is full"
+        end
+        return true, stored, " (storage full, " .. remaining .. " returned)"
+    end
+
+    return true, removed, ""
+end
+
+local function depositHand(player, count)
+    local entry = getManagerEntry(player)
+    if not entry then
+        return false, "No memory card found for " .. player
+    end
+    if count ~= "alloftype" and (type(count) ~= "number" or count < 0) then
+        return false, "Invalid count."
+    end
+    local mgr = entry.mgr
+    local bufferName = entry.bufferName
+
+    local handItem = mgr.getItemInHand and mgr.getItemInHand() or nil
+    if not handItem or not handItem.name then
+        return false, "No item in hand (or getItemInHand not supported)"
+    end
+
+    local itemName = handItem.name
+    local toRemove
+
+    if count == "alloftype" then
+        local ok, items = pcall(mgr.getItems)
+        local total = 0
+        if ok and items then
+            for _, item in pairs(items) do
+                if item.name == itemName then
+                    total = total + item.count
+                end
+            end
+        end
+        toRemove = (total > 0) and total or handItem.count
+    else
+        local available = handItem.count
+        toRemove = (count == 0 or count >= available) and available or count
+    end
+
+    local removed = 0
+    local stillNeeded = toRemove
+    while stillNeeded > 0 do
+        local got = mgr.removeItemFromPlayer(BUFFER_DIRECTION, { name = itemName, count = stillNeeded })
+        if not got or got == 0 then
+            break -- nothing more available to remove
+        end
+        removed = removed + got
+        stillNeeded = stillNeeded - got
+    end
+
+    if removed == 0 then
+        return false, "Could not remove item from your hand"
+    end
+
+    local inBuffer = countItemInBuffer(bufferName, itemName)
+    if inBuffer < removed then
+        removed = inBuffer
+    end
+    if removed == 0 then
+        return false, "Item did not arrive in buffer barrel"
+    end
+
+    local moved = pushToWritableStorage(bufferName, removed)
+    local remaining = removed - moved
+
+    if remaining > 0 then
+        mgr.addItemToPlayer(BUFFER_DIRECTION, { name = itemName, count = remaining })
+        local stored = removed - remaining
+        if stored == 0 then
+            return false, "Storage is full"
+        end
+        return true, stored, itemName, " (storage full, " .. remaining .. " returned)"
+    end
+
+    return true, removed, itemName, ""
+end
+
+local HOTBAR_SLOTS = { [1]=true, [2]=true, [3]=true, [4]=true, [5]=true,
+                       [6]=true, [7]=true, [8]=true, [9]=true }
+local OFFHAND_SLOT = 36
+
+local function dumpInventory(player)
+    local entry = getManagerEntry(player)
+    if not entry then
+        return false, "No memory card found for " .. player
+    end
+    local mgr = entry.mgr
+    local bufferName = entry.bufferName
+
+    local ok, items = pcall(mgr.getItems)
+    if not ok or not items then
+        return false, "Could not read your inventory"
+    end
+
+    local groups = {}
+    for _, item in pairs(items) do
+        local slot = item.slot
+        if slot and not HOTBAR_SLOTS[slot] and slot ~= OFFHAND_SLOT then
+            local key = item.name .. "|" .. tostring(item.nbt or "")
+            if groups[key] then
+                groups[key].count = groups[key].count + item.count
+            else
+                groups[key] = {
+                    name = item.name,
+                    nbt = item.nbt,
+                    count = item.count,
+                    displayName = item.displayName,
+                }
+            end
+        end
+    end
+
+    local succeeded = {}
+    local failed = {}
+
+    for _, group in pairs(groups) do
+        local itemSpec = { name = group.name, count = group.count }
+        if group.nbt then itemSpec.nbt = group.nbt end
+
+        local removed = mgr.removeItemFromPlayer(BUFFER_DIRECTION, itemSpec)
+        if not removed or removed == 0 then
+            table.insert(failed, { item = group.displayName or group.name, reason = "Could not remove from inventory" })
+        else
+            local inBuffer = countItemInBuffer(bufferName, group.name)
+            if inBuffer < removed then removed = inBuffer end
+
+            if removed == 0 then
+                table.insert(failed, { item = group.displayName or group.name, reason = "Did not arrive in buffer barrel" })
+            else
+                local moved = pushToWritableStorage(bufferName, removed)
+                local remaining = removed - moved
+
+                if remaining > 0 then
+                    local giveSpec = { name = group.name, count = remaining }
+                    if group.nbt then giveSpec.nbt = group.nbt end
+                    mgr.addItemToPlayer(BUFFER_DIRECTION, giveSpec)
+                end
+
+                local stored = removed - remaining
+                if stored > 0 then
+                    table.insert(succeeded, { item = group.displayName or group.name, count = stored })
+                end
+                if remaining > 0 then
+                    table.insert(failed, { item = group.displayName or group.name, reason = "storage full, " .. remaining .. " returned" })
+                end
+            end
+        end
+    end
+
+    return true, succeeded, failed
+end
+
+local function withdrawItem(player, itemName, count, nbt)
+    local entry = getManagerEntry(player)
+    if not entry then
+        return false, "No memory card found for " .. player
+    end
+    if count ~= "all" and (type(count) ~= "number" or count <= 0) then
+        return false, "Invalid count."
+    end
+    local mgr = entry.mgr
+    local bufferName = entry.bufferName
+
+    local nameMatches = resolveItemName(itemName)
+    if #nameMatches == 0 then
+        return false, "Item not found in storage: " .. itemName
+    end
+    local distinctNames = {}
+    local seenNames = {}
+    for _, m in ipairs(nameMatches) do
+        if not seenNames[m.name] then
+            seenNames[m.name] = true
+            table.insert(distinctNames, m)
+        end
+    end
+    if #distinctNames > 1 then
+        local names = {}
+        for _, m in ipairs(distinctNames) do
+            table.insert(names, m.displayName or m.name)
+        end
+        return false, "Multiple matches: " .. table.concat(names, ", ") .. ". Be more specific."
+    end
+    itemName = distinctNames[1].name
+
+    if nbt == nil then
+        local variants = findItemVariants(itemName)
+        if #variants > 1 then
+            local lines = {}
+            for _, v in ipairs(variants) do
+                local label = v.enchants or "Plain"
+                table.insert(lines, label .. " x" .. v.count)
+            end
+            return false, "Multiple variants found: " .. table.concat(lines, " | ") .. ". Use `request " .. itemName .. " <count> <variant#>"
+        end
+    end
+
+    local slots = findItemInBarrels(itemName, nbt)
+    if #slots == 0 then
+        rebuildBarrelList()
+        rebuildCache()
+        slots = findItemInBarrels(itemName, nbt)
+    end
+    if #slots == 0 then
+        return false, "Item not found in storage: " .. itemName
+    end
+
+    if count == "all" then
+        count = 0
+        for _, s in ipairs(slots) do
+            count = count + s.count
+        end
+        if count == 0 then
+            return false, "Item not found in storage: " .. itemName
+        end
+    end
+
+    local remaining = count
+    local touchedBarrels = {}
+    for _, slot in ipairs(slots) do
+        if remaining <= 0 then break end
+        local toTake = math.min(remaining, slot.count)
+        local storageBarrel = peripheral.wrap(slot.barrelName)
+        local ok, moved = pcall(storageBarrel.pushItems, bufferName, slot.slot, toTake)
+        if ok and moved and moved > 0 then
+            remaining = remaining - moved
+            touchedBarrels[slot.barrelName] = true
+        end
+    end
+
+    for _, barrel in ipairs(barrels) do
+        if touchedBarrels[barrel.name] then
+            refreshBarrelCache(barrel)
+        end
+    end
+
+    local requestedMoved = count - remaining
+    if requestedMoved <= 0 then
+        return false, "Could not move items from storage"
+    end
+
+    local inBuffer = countItemInBuffer(bufferName, itemName)
+    local totalMoved = math.min(requestedMoved, inBuffer)
+    if totalMoved <= 0 then
+        return false, "Item did not arrive in buffer barrel"
+    end
+
+    local giveSpec = { name = itemName, count = totalMoved }
+    if nbt then giveSpec.nbt = nbt end
+    local given = mgr.addItemToPlayer(BUFFER_DIRECTION, giveSpec)
+    local actualGiven = given or totalMoved
+
+    local stillInBuffer = countItemInBuffer(bufferName, itemName)
+    if stillInBuffer > 0 then
+        pushToWritableStorage(bufferName, stillInBuffer)
+    end
+
+    return true, actualGiven
+end
+
+local function withdrawMultiple(player, itemNames, count)
+    local succeeded = {}
+    local failed = {}
+
+    for _, itemName in ipairs(itemNames) do
+        itemName = itemName:match("^%s*(.-)%s*$") -- trim whitespace
+        if itemName ~= "" then
+            local ok, result = withdrawItem(player, itemName, count)
+            if ok then
+                table.insert(succeeded, { item = itemName, count = result })
+            else
+                table.insert(failed, { item = itemName, reason = result })
+            end
+        end
+    end
+
+    return succeeded, failed
+end
+
+local function handleChat(player, message)
+    local args = {}
+    for word in message:gmatch("%S+") do
+        table.insert(args, word)
+    end
+
+    local cmd = args[1]:sub(2):lower()
+
+    if not isWhitelisted(player) then
+        sendChat(player, "You are not authorized.")
+        return
+    end
+
+    if cmd == "request" then
+        local rawArgs = message:match("^%S+%s+(.*)$") or ""
+        if rawArgs == "" then
+            sendChat(player, "Usage: `request <item>[, item2, item3...] <count|all> [variant#]")
+            return
+        end
+
+        local tokens = {}
+        for word in rawArgs:gmatch("%S+") do table.insert(tokens, word) end
+
+        local variantNum = nil
+
+        local countIdx = nil
+        for i = #tokens, 1, -1 do
+            if tokens[i]:lower() == "all" or tonumber(tokens[i]) then
+                countIdx = i
+                break
+            end
+        end
+
+        if not countIdx then
+            sendChat(player, "Usage: `request <item>[, item2] <count|all> [variant#]")
+            return
+        end
+
+        local countToken = tokens[countIdx]
+        local count = (countToken:lower() == "all") and "all" or tonumber(countToken)
+
+        if tokens[countIdx + 1] and tonumber(tokens[countIdx + 1]) then
+            variantNum = tonumber(tokens[countIdx + 1])
+        end
+
+        local itemPart = table.concat(tokens, " ", 1, countIdx - 1)
+        if itemPart == "" then
+            sendChat(player, "Usage: `request <item>[, item2] <count|all> [variant#]")
+            return
+        end
+
+        local itemNames = {}
+        for name in itemPart:gmatch("[^,]+") do
+            name = name:match("^%s*(.-)%s*$")
+            if name ~= "" then table.insert(itemNames, name) end
+        end
+
+        if #itemNames == 0 then
+            sendChat(player, "Usage: `request <item>[, item2] <count|all> [variant#]")
+            return
+        end
+
+        if #itemNames == 1 then
+            local nbt = nil
+            if variantNum then
+                local nameMatches = resolveItemName(itemNames[1])
+                if #nameMatches == 0 then
+                    sendChat(player, "Item not found in storage: " .. itemNames[1])
+                    return
+                end
+                local resolvedName = nameMatches[1].name
+                local variants = findItemVariants(resolvedName)
+                table.sort(variants, function(a, b) return (a.enchants or "") < (b.enchants or "") end)
+                local chosen = variants[variantNum]
+                if not chosen then
+                    sendChat(player, "Invalid variant number for " .. itemNames[1])
+                    return
+                end
+                nbt = chosen.nbt
+            end
+
+            local ok, result = withdrawItem(player, itemNames[1], count, nbt)
+            if ok then
+                addLog("[-] " .. player .. " withdrew " .. result .. "x " .. itemNames[1] .. " (chat)")
+                sendChat(player, "Gave you " .. result .. "x " .. itemNames[1])
+            else
+                addLog("[!] " .. player .. " request failed: " .. result)
+                sendChat(player, "Error: " .. result)
+            end
+        else
+            local succeeded, failed = withdrawMultiple(player, itemNames, count)
+
+            if #succeeded > 0 then
+                local parts = {}
+                for _, s in ipairs(succeeded) do
+                    table.insert(parts, s.count .. "x " .. s.item)
+                end
+                local summary = table.concat(parts, ", ")
+                addLog("[-] " .. player .. " withdrew (multi): " .. summary)
+                sendChat(player, "Gave you: " .. summary)
+            end
+
+            if #failed > 0 then
+                local parts = {}
+                for _, f in ipairs(failed) do
+                    table.insert(parts, f.item .. " (" .. f.reason .. ")")
+                end
+                local summary = table.concat(parts, "; ")
+                addLog("[!] " .. player .. " failed (multi): " .. summary)
+                sendChat(player, "Failed: " .. summary)
+            end
+        end
+
+    elseif cmd == "deposit" then
+        local target = args[2]
+        if not target then
+            sendChat(player, "Usage: `deposit <item|hand> <count|all>")
+            return
+        end
+
+        if target:lower() == "hand" then
+            local countArg = args[3] or "all"
+            local count
+            if countArg:lower() == "all" then
+                count = 0
+            elseif countArg:lower() == "alloftype" then
+                count = "alloftype"
+            else
+                count = tonumber(countArg)
+            end
+            if count == nil then
+                sendChat(player, "Usage: `deposit hand <count|all|alloftype>")
+                return
+            end
+            local ok, result, itemName, note = depositHand(player, count)
+            if ok then
+                addLog("[+] " .. player .. " deposited " .. result .. "x " .. itemName .. " (chat/hand)" .. note)
+                sendChat(player, "Deposited " .. result .. "x " .. itemName .. note)
+            else
+                addLog("[!] " .. player .. " hand deposit failed: " .. result)
+                sendChat(player, "Error: " .. result)
+            end
+        else
+            local itemName = target
+            local countArg = args[3] or "all"
+            local count = (countArg:lower() == "all") and 0 or tonumber(countArg)
+            if count == nil then
+                sendChat(player, "Usage: `deposit <item> <count|all>")
+                return
+            end
+            local ok, result, note = depositItem(player, itemName, count)
+            if ok then
+                addLog("[+] " .. player .. " deposited " .. result .. "x " .. itemName .. " (chat)" .. note)
+                sendChat(player, "Deposited " .. result .. "x " .. itemName .. note)
+            else
+                addLog("[!] " .. player .. " deposit failed: " .. result)
+                sendChat(player, "Error: " .. result)
+            end
+        end
+
+    elseif cmd == "dump" then
+        local ok, succeeded, failed = dumpInventory(player)
+        if not ok then
+            sendChat(player, "Error: " .. tostring(succeeded))
+            return
+        end
+
+        if #succeeded == 0 and #failed == 0 then
+            sendChat(player, "Nothing to dump.")
+            return
+        end
+
+        if #succeeded > 0 then
+            local parts = {}
+            for _, s in ipairs(succeeded) do
+                table.insert(parts, s.count .. "x " .. s.item)
+            end
+            local summary = table.concat(parts, ", ")
+            addLog("[+] " .. player .. " dumped: " .. summary)
+            sendChat(player, "Dumped: " .. summary)
+        end
+
+        if #failed > 0 then
+            local parts = {}
+            for _, f in ipairs(failed) do
+                table.insert(parts, f.item .. " (" .. f.reason .. ")")
+            end
+            local summary = table.concat(parts, "; ")
+            addLog("[!] " .. player .. " dump issues: " .. summary)
+            sendChat(player, "Issues: " .. summary)
+        end
+
+    else
+        sendChat(player, "Unknown command. Try `deposit, `request, or `dump")
+    end
+end
+
+local function handleRednet(senderId, message)
+    if type(message) ~= "table" then
+        addLog("[debug] Received non-table rednet message from " .. tostring(senderId))
+        return
+    end
+    local cmd = message.cmd
+    local player = message.player
+    addLog("[debug] Received cmd='" .. tostring(cmd) .. "' from " .. tostring(player))
+
+    if not player then
+        rednet.send(senderId, { ok = false, err = "No player specified." }, "storage")
+        return
+    end
+
+    if cmd == "ping" then
+        rednet.send(senderId, { ok = true, msg = "pong" }, "storage")
+        return
+    end
+
+    if not isWhitelisted(player) then
+        rednet.send(senderId, { ok = false, err = "You are not authorized." }, "storage")
+        return
+    end
+
+    if cmd == "stock" then
+        local stock = getStock()
+        rednet.send(senderId, { ok = true, stock = stock }, "storage")
+
+    elseif cmd == "deposit" then
+        local itemName = message.item
+        local count = message.count or 1
+        if not itemName then
+            rednet.send(senderId, { ok = false, err = "No item specified." }, "storage")
+            return
+        end
+        local ok, result, note = depositItem(player, itemName, count)
+        if ok then
+            note = note or ""
+            addLog("[+] " .. player .. " deposited " .. result .. "x " .. itemName .. note)
+            rednet.send(senderId, { ok = true, msg = "Deposited " .. result .. "x " .. itemName .. note }, "storage")
+        else
+            addLog("[!] " .. player .. " deposit failed: " .. result)
+            rednet.send(senderId, { ok = false, err = result }, "storage")
+        end
+
+    elseif cmd == "deposit_hand" then
+        local count = message.count or 0
+        local ok, result, itemName, note = depositHand(player, count)
+        if ok then
+            note = note or ""
+            addLog("[+] " .. player .. " deposited " .. result .. "x " .. itemName .. " (hand)" .. note)
+            rednet.send(senderId, { ok = true, msg = "Deposited " .. result .. "x " .. itemName .. note }, "storage")
+        else
+            addLog("[!] " .. player .. " hand deposit failed: " .. result)
+            rednet.send(senderId, { ok = false, err = result }, "storage")
+        end
+
+    elseif cmd == "dump" then
+        local ok, succeeded, failed = dumpInventory(player)
+        if not ok then
+            rednet.send(senderId, { ok = false, err = tostring(succeeded) }, "storage")
+            return
+        end
+
+        if #succeeded == 0 and #failed == 0 then
+            rednet.send(senderId, { ok = true, msg = "Nothing to dump." }, "storage")
+            return
+        end
+
+        local msgParts = {}
+        if #succeeded > 0 then
+            local parts = {}
+            for _, s in ipairs(succeeded) do
+                table.insert(parts, s.count .. "x " .. s.item)
+            end
+            table.insert(msgParts, "Dumped: " .. table.concat(parts, ", "))
+            addLog("[+] " .. player .. " dumped: " .. table.concat(parts, ", "))
+        end
+        if #failed > 0 then
+            local parts = {}
+            for _, f in ipairs(failed) do
+                table.insert(parts, f.item .. " (" .. f.reason .. ")")
+            end
+            table.insert(msgParts, "Issues: " .. table.concat(parts, "; "))
+            addLog("[!] " .. player .. " dump issues: " .. table.concat(parts, "; "))
+        end
+
+        if #succeeded == 0 then
+            rednet.send(senderId, { ok = false, err = table.concat(msgParts, " | ") }, "storage")
+        else
+            rednet.send(senderId, { ok = true, msg = table.concat(msgParts, " | ") }, "storage")
+        end
+
+    elseif cmd == "request" then
+        local itemName = message.item
+        local count = message.count or 1
+        local nbt = message.nbt  -- optional, sent by client when a specific variant was chosen
+        if not itemName then
+            rednet.send(senderId, { ok = false, err = "No item specified." }, "storage")
+            return
+        end
+        local ok, result = withdrawItem(player, itemName, count, nbt)
+        if ok then
+            addLog("[-] " .. player .. " withdrew " .. result .. "x " .. itemName)
+            rednet.send(senderId, { ok = true, msg = "Gave you " .. result .. "x " .. itemName }, "storage")
+        else
+            addLog("[!] " .. player .. " request failed: " .. result)
+            rednet.send(senderId, { ok = false, err = result }, "storage")
+        end
+
+    elseif cmd == "request_multi" then
+        local itemsRaw = message.items
+        local count = message.count or 1
+        if not itemsRaw then
+            rednet.send(senderId, { ok = false, err = "No items specified." }, "storage")
+            return
+        end
+        local itemNames = {}
+        for name in itemsRaw:gmatch("[^,]+") do
+            name = name:match("^%s*(.-)%s*$")
+            if name ~= "" then table.insert(itemNames, name) end
+        end
+        if #itemNames == 0 then
+            rednet.send(senderId, { ok = false, err = "No valid items in list." }, "storage")
+            return
+        end
+
+        local succeeded, failed = withdrawMultiple(player, itemNames, count)
+
+        local msgParts = {}
+        if #succeeded > 0 then
+            local parts = {}
+            for _, s in ipairs(succeeded) do
+                table.insert(parts, s.count .. "x " .. s.item)
+            end
+            table.insert(msgParts, "Gave: " .. table.concat(parts, ", "))
+            addLog("[-] " .. player .. " withdrew (multi): " .. table.concat(parts, ", "))
+        end
+        if #failed > 0 then
+            local parts = {}
+            for _, f in ipairs(failed) do
+                table.insert(parts, f.item .. " (" .. f.reason .. ")")
+            end
+            table.insert(msgParts, "Failed: " .. table.concat(parts, "; "))
+            addLog("[!] " .. player .. " failed (multi): " .. table.concat(parts, "; "))
+        end
+
+        if #succeeded == 0 then
+            rednet.send(senderId, { ok = false, err = table.concat(msgParts, " | ") }, "storage")
+        else
+            rednet.send(senderId, { ok = true, msg = table.concat(msgParts, " | ") }, "storage")
+        end
+
+    elseif cmd == "variants" then
+        local itemName = message.item
+        if not itemName then
+            rednet.send(senderId, { ok = false, err = "No item specified." }, "storage")
+            return
+        end
+        local nameMatches = resolveItemName(itemName)
+        if #nameMatches == 0 then
+            rednet.send(senderId, { ok = true, variants = {} }, "storage")
+            return
+        end
+        local resolvedName = nameMatches[1].name
+        local variants = findItemVariants(resolvedName)
+        table.sort(variants, function(a, b) return (a.enchants or "") < (b.enchants or "") end)
+        rednet.send(senderId, { ok = true, variants = variants, resolvedName = resolvedName }, "storage")
+
+    elseif cmd == "item_detail" then
+        local itemName = message.item
+        local nbt = message.nbt
+        if not itemName then
+            rednet.send(senderId, { ok = false, err = "No item specified." }, "storage")
+            return
+        end
+
+        local foundBarrelName, foundSlot = nil, nil
+        forEachCachedItem(function(barrelName, slot, item)
+            if not foundBarrelName and item.name == itemName and item.nbt == nbt then
+                foundBarrelName, foundSlot = barrelName, slot
+            end
+        end)
+
+        if not foundBarrelName then
+            rednet.send(senderId, { ok = false, err = "Item not found in storage." }, "storage")
+            return
+        end
+
+        local barrel = nil
+        for _, b in ipairs(barrels) do
+            if b.name == foundBarrelName then barrel = b; break end
+        end
+        if not barrel then
+            rednet.send(senderId, { ok = false, err = "Barrel not found." }, "storage")
+            return
+        end
+
+        local detailOk, detail = getItemDetailSafe(barrel, foundSlot)
+        if not detailOk or not detail then
+            rednet.send(senderId, { ok = false, err = "Could not fetch item details." }, "storage")
+            return
+        end
+
+        local result = {
+            name = detail.name,
+            displayName = detail.displayName,
+            enchants = formatEnchants(detail),
+            potionEffects = formatPotionEffects(detail),
+            maxCount = detail.maxCount,
+        }
+        if detail.damage ~= nil and detail.maxDamage ~= nil then
+            result.damage = detail.damage
+            result.maxDamage = detail.maxDamage
+        end
+
+        local totalInStorage = 0
+        for _, slot in ipairs(findItemInBarrels(itemName, nbt)) do
+            totalInStorage = totalInStorage + slot.count
+        end
+        result.totalInStorage = totalInStorage
+
+        rednet.send(senderId, { ok = true, detail = result }, "storage")
+
+    else
+        rednet.send(senderId, { ok = false, err = "Unknown command: " .. tostring(cmd) }, "storage")
+    end
+end
+
+rebuildCache()
+print("Cache ready.")
+
+local RESYNC_INTERVAL = 60 -- seconds
+local resyncTimer = os.startTimer(RESYNC_INTERVAL)
+
+local MANAGER_RESYNC_INTERVAL = 15 -- seconds
+local managerResyncTimer = os.startTimer(MANAGER_RESYNC_INTERVAL)
+
+local activePlayers = {}
+for player in pairs(playerManagerMap) do
+    activePlayers[player] = true
+end
+
+local function announceNewlyActivePlayers()
+    for key, entry in pairs(playerManagerMap) do
+        if not activePlayers[key] then
+            activePlayers[key] = true
+            local displayName = key
+            for _, name in ipairs(WHITELIST) do
+                if name:lower() == key then displayName = name; break end
+            end
+            addLog("[+] " .. displayName .. " is now active (card detected).")
+            sendChat(displayName, "Welcome, " .. displayName .. "! Storage system is ready for you.")
+        end
+    end
+    for key in pairs(activePlayers) do
+        if not playerManagerMap[key] then
+            activePlayers[key] = nil
+        end
+    end
+end
+
+addLog("Server ready. Hostname: " .. SERVER_HOSTNAME)
+
+while true do
+    local event, p1, p2, p3 = os.pullEvent()
+
+    if event == "rednet_message" then
+        local senderId, message, protocol = p1, p2, p3
+        if protocol == "storage" then
+            local ok, err = pcall(handleRednet, senderId, message)
+            if not ok then
+                addLog("[ERROR] handleRednet crashed: " .. tostring(err))
+            end
+        end
+
+    elseif event == "chat" then
+        local player, message = p1, p2
+        if type(message) == "string" and message:sub(1, 1) == "`" then
+            local ok, err = pcall(handleChat, player, message)
+            if not ok then
+                addLog("[ERROR] handleChat crashed: " .. tostring(err))
+            end
+        end
+
+    elseif event == "playerJoin" then
+        local username, dimension = p1, p2
+        if isWhitelisted(username) then
+            buildManagerMap()
+            announceNewlyActivePlayers()
+        end
+
+    elseif event == "peripheral" then
+        local side = p1
+        addLog("Peripheral attached: " .. tostring(side) .. ", refreshing barrel list.")
+        local ok, err = pcall(function()
+            rebuildBarrelList()
+            rebuildCache()
+        end)
+        if not ok then
+            addLog("[ERROR] Failed to refresh after peripheral attach: " .. tostring(err))
+        end
+
+    elseif event == "peripheral_detach" then
+        local side = p1
+        addLog("Peripheral detached: " .. tostring(side) .. ", refreshing barrel list.")
+        local ok, err = pcall(function()
+            rebuildBarrelList()
+            rebuildCache()
+        end)
+        if not ok then
+            addLog("[ERROR] Failed to refresh after peripheral detach: " .. tostring(err))
+        end
+        if activeBarrelName then
+            local stillExists = false
+            for _, b in ipairs(barrels) do
+                if b.name == activeBarrelName then stillExists = true; break end
+            end
+            if not stillExists then
+                addLog("Active deposit barrel was disconnected, will pick a new one.")
+                activeBarrelName = nil
+                saveActiveBarrel(nil)
+            end
+        end
+
+    elseif event == "timer" and p1 == resyncTimer then
+        rebuildCache()
+        addLog("Background cache resync complete.")
+        resyncTimer = os.startTimer(RESYNC_INTERVAL)
+
+    elseif event == "timer" and p1 == managerResyncTimer then
+        buildManagerMap()
+        announceNewlyActivePlayers()
+        managerResyncTimer = os.startTimer(MANAGER_RESYNC_INTERVAL)
+    end
+end
