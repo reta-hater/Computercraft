@@ -3,10 +3,14 @@ basalt.LOGGER.setEnabled(true)
 basalt.LOGGER.setLogToFile(true)
 
 local MODEM_SIDE = "back"         -- built-in modem on pocket computers
-local PLAYER_NAME = "Steve"       -- !! Change to your in-game name !!
+local PLAYER_NAME = "Z_DDM"       -- !! Change to your in-game name !!
 local SERVER_HOSTNAME = "storage_server"
 local TIMEOUT = 5                 -- seconds to wait for server response
-local DOUBLE_TAP_WINDOW = 0.8     -- seconds allowed between taps to count as a double-tap
+local actionQueue = {}
+
+local function queueAction(fn)
+    table.insert(actionQueue, fn)
+end
 
 rednet.open(MODEM_SIDE)
 
@@ -261,37 +265,7 @@ detailQuickRequestBtn:onClick(function()
     end
 end)
 
-local pendingTap = {} -- rowId -> { key, timerId, singleAction }
-local actionQueue = {}
 
-local function queueAction(fn)
-    table.insert(actionQueue, fn)
-end
-
-local function handleTap(rowId, key, singleAction, doubleAction)
-    local pending = pendingTap[rowId]
-    if pending and pending.key == key then
-        pendingTap[rowId] = nil
-        queueAction(doubleAction)
-    else
-        local timerId = os.startTimer(DOUBLE_TAP_WINDOW)
-        pendingTap[rowId] = {
-            key = key,
-            timerId = timerId,
-            singleAction = singleAction,
-        }
-    end
-end
-
-basalt.onEvent("timer", function(id)
-    for rowId, pending in pairs(pendingTap) do
-        if pending.timerId == id then
-            pendingTap[rowId] = nil
-            queueAction(pending.singleAction)
-            return
-        end
-    end
-end)
 
 local stockTab = tabs:newTab("Stock")
 
@@ -378,17 +352,11 @@ for i = 1, STOCK_ROWS_PER_PAGE do
     rowFrame:onClick(function()
         local row = stockRowLabels[i]
         if not row.item then return end
-        local key = row.item.name .. "|" .. tostring(row.item.nbt or "")
         local item = row.item
-        handleTap(
-            "stock_row_" .. i,
-            key,
-            function() end, -- single tap on a stock row does nothing
-            function()
-                local shortName = item.displayName or (item.name:match(":(.+)$") or item.name)
-                showDetailPopup(item.name, item.nbt, shortName)
-            end
-        )
+        local shortName = item.displayName or (item.name:match(":(.+)$") or item.name)
+        queueAction(function()
+            showDetailPopup(item.name, item.nbt, shortName)
+        end)
     end)
 end
 
@@ -752,18 +720,7 @@ end
 for i, btn in ipairs(variantButtons) do
     btn:onClick(function()
         if not currentVariants or not currentVariants[i] then return end
-        local chosen = currentVariants[i]
-        local itemName = currentVariantItem
-        local key = itemName .. "|" .. tostring(chosen.nbt or "")
-        handleTap(
-            "variant_row_" .. i,
-            key,
-            function() selectVariant(i) end,
-            function()
-                local label = chosen.enchants or itemName
-                showDetailPopup(itemName, chosen.nbt, label)
-            end
-        )
+        selectVariant(i)
     end)
 end
 
