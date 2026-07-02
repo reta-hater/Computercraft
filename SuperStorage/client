@@ -1,0 +1,810 @@
+local basalt = require("basalt")
+basalt.LOGGER.setEnabled(true)
+basalt.LOGGER.setLogToFile(true)
+
+local MODEM_SIDE = "back"         -- built-in modem on pocket computers
+local PLAYER_NAME = "Steve"       -- !! Change to your in-game name !!
+local SERVER_HOSTNAME = "storage_server"
+local TIMEOUT = 5                 -- seconds to wait for server response
+local DOUBLE_TAP_WINDOW = 0.8     -- seconds allowed between taps to count as a double-tap
+
+rednet.open(MODEM_SIDE)
+
+local serverId = nil
+
+local function findServer()
+    local id = rednet.lookup("storage", SERVER_HOSTNAME)
+    return id
+end
+
+local function send(msg)
+    if not serverId then
+        serverId = findServer()
+        if not serverId then return nil end
+    end
+    msg.player = PLAYER_NAME
+    rednet.send(serverId, msg, "storage")
+    local _, response = rednet.receive("storage", TIMEOUT)
+    if not response then
+        serverId = findServer()
+        if not serverId then return nil end
+        rednet.send(serverId, msg, "storage")
+        _, response = rednet.receive("storage", TIMEOUT)
+    end
+    return response
+end
+
+local main = basalt.getMainFrame()
+main:setBackground(colors.black)
+
+local statusBar = main:addLabel({
+    x = 1, y = 1,
+    width = "{parent.width}",
+    text = " STORAGE - " .. PLAYER_NAME,
+    background = colors.gray,
+    foreground = colors.white,
+})
+
+local connDot = main:addLabel({
+    x = "{parent.width - 9}", y = 1,
+    text = "CONNECTING",
+    background = colors.gray,
+    foreground = colors.yellow,
+})
+
+local msgLabel = main:addLabel({
+    x = 1, y = 2,
+    width = "{parent.width}",
+    text = "",
+    background = colors.black,
+    foreground = colors.white,
+})
+
+local function setMessage(text, color)
+    msgLabel:setText(text)
+    msgLabel:setForeground(color or colors.white)
+end
+
+local function setConnected(ok)
+    if ok then
+        connDot:setText("ONLINE")
+        connDot:setForeground(colors.lime)
+    else
+        connDot:setText("OFFLINE")
+        connDot:setForeground(colors.red)
+    end
+end
+
+local tabs = main:addTabControl({
+    x = 1, y = 3,
+    width = "{parent.width}",
+    height = "{parent.height - 2}",
+    headerBackground = colors.gray,
+    activeTabBackground = colors.lightGray,
+    activeTabTextColor = colors.black,
+})
+
+local detailPopup = main:addFrame({
+    x = 3, y = 4,
+    width = "{parent.width - 4}",
+    height = "{parent.height - 6}",
+    background = colors.gray,
+})
+detailPopup:setVisible(false)
+
+local detailTitle = detailPopup:addLabel({
+    x = 2, y = 1,
+    width = "{parent.width - 3}",
+    text = "",
+    foreground = colors.yellow,
+    background = colors.gray,
+})
+
+local detailCloseBtn = detailPopup:addButton({
+    x = "{parent.width - 2}", y = 1,
+    width = 3, height = 1,
+    text = "X",
+    background = colors.red,
+    foreground = colors.white,
+})
+
+local DETAIL_BODY_LINES = 6
+local detailBodyLabels = {}
+for i = 1, DETAIL_BODY_LINES do
+    detailBodyLabels[i] = detailPopup:addLabel({
+        x = 2, y = 2 + i,
+        width = "{parent.width - 3}",
+        text = "",
+        foreground = colors.white,
+        background = colors.gray,
+    })
+end
+
+local detailQuickRequestBtn = detailPopup:addButton({
+    x = 2, y = "{parent.height - 1}",
+    width = "{parent.width - 3}",
+    height = 1,
+    text = "Request ALL of this item",
+    background = colors.green,
+})
+
+local currentDetailItem = nil -- { name, nbt } of whatever the popup is currently showing
+
+local function closeDetailPopup()
+    detailPopup:setVisible(false)
+    currentDetailItem = nil
+end
+
+detailCloseBtn:onClick(function()
+    closeDetailPopup()
+end)
+
+local function wrapText(text, maxWidth)
+    local lines = {}
+    local current = ""
+    for word in text:gmatch("%S+") do
+        local candidate = (current == "") and word or (current .. " " .. word)
+        if #candidate > maxWidth then
+            if current ~= "" then
+                table.insert(lines, current)
+            end
+            if #word > maxWidth then
+                local remaining = word
+                while #remaining > maxWidth do
+                    table.insert(lines, remaining:sub(1, maxWidth))
+                    remaining = remaining:sub(maxWidth + 1)
+                end
+                current = remaining
+            else
+                current = word
+            end
+        else
+            current = candidate
+        end
+    end
+    if current ~= "" then
+        table.insert(lines, current)
+    end
+    return lines
+end
+
+local function showDetailPopup(itemName, nbt, displayNameFallback)
+    currentDetailItem = { name = itemName, nbt = nbt }
+    detailTitle:setText(displayNameFallback or itemName)
+    for i = 1, DETAIL_BODY_LINES do
+        detailBodyLabels[i]:setText("")
+    end
+    detailBodyLabels[1]:setText("Loading...")
+    detailQuickRequestBtn:setText("Request 1 Stack")
+    detailPopup:setVisible(true)
+
+    local resp = send({ cmd = "item_detail", item = itemName, nbt = nbt })
+
+    if not currentDetailItem or currentDetailItem.name ~= itemName or currentDetailItem.nbt ~= nbt then
+        return
+    end
+
+    for i = 1, DETAIL_BODY_LINES do
+        detailBodyLabels[i]:setText("")
+    end
+
+    if not resp or not resp.ok then
+        detailBodyLabels[1]:setText(resp and resp.err or "Could not load details.")
+        return
+    end
+
+    local d = resp.detail
+    local line = 1
+    local maxWidth = 24 -- conservative width for pocket computer screens
+
+    local function addWrapped(prefix, content)
+        local fullText = prefix .. content
+        local wrapped = wrapText(fullText, maxWidth)
+        for _, wline in ipairs(wrapped) do
+            if line <= DETAIL_BODY_LINES then
+                detailBodyLabels[line]:setText(wline)
+                line = line + 1
+            end
+        end
+    end
+
+    detailTitle:setText(d.displayName or itemName)
+
+    if d.enchants then
+        addWrapped("Enchants: ", d.enchants)
+    end
+
+    if d.potionEffects then
+        addWrapped("Effects: ", d.potionEffects)
+    end
+
+    if d.damage ~= nil and d.maxDamage ~= nil then
+        local remaining = d.maxDamage - d.damage
+        addWrapped("Durability: ", remaining .. "/" .. d.maxDamage)
+    end
+
+    if line == 1 then
+        detailBodyLabels[1]:setText("No special properties.")
+    end
+
+    local maxCount = d.maxCount or 64
+    local totalInStorage = d.totalInStorage or 0
+    local requestAmount = math.min(maxCount, totalInStorage)
+    currentDetailItem.requestAmount = requestAmount
+
+    if requestAmount <= 0 then
+        detailQuickRequestBtn:setText("None in storage")
+    elseif totalInStorage < maxCount then
+        detailQuickRequestBtn:setText("Request All (" .. requestAmount .. ")")
+    else
+        detailQuickRequestBtn:setText("Request 1 Stack (" .. requestAmount .. ")")
+    end
+end
+
+detailQuickRequestBtn:onClick(function()
+    if not currentDetailItem then return end
+    local itemName, nbt = currentDetailItem.name, currentDetailItem.nbt
+    local requestAmount = currentDetailItem.requestAmount
+    if not requestAmount or requestAmount <= 0 then return end
+    closeDetailPopup()
+    setMessage("Requesting " .. requestAmount .. "x " .. itemName .. "...", colors.yellow)
+    local resp = send({ cmd = "request", item = itemName, count = requestAmount, nbt = nbt })
+    if not resp then
+        setConnected(false)
+        setMessage("No response from server.", colors.red)
+    elseif resp.ok then
+        setConnected(true)
+        setMessage(resp.msg, colors.lime)
+    else
+        setConnected(true)
+        setMessage(resp.err, colors.red)
+    end
+end)
+
+local pendingTap = {} -- rowId -> { key, timerId, singleAction }
+local actionQueue = {}
+
+local function queueAction(fn)
+    table.insert(actionQueue, fn)
+end
+
+local function handleTap(rowId, key, singleAction, doubleAction)
+    local pending = pendingTap[rowId]
+    if pending and pending.key == key then
+        pendingTap[rowId] = nil
+        queueAction(doubleAction)
+    else
+        local timerId = os.startTimer(DOUBLE_TAP_WINDOW)
+        pendingTap[rowId] = {
+            key = key,
+            timerId = timerId,
+            singleAction = singleAction,
+        }
+    end
+end
+
+basalt.onEvent("timer", function(id)
+    for rowId, pending in pairs(pendingTap) do
+        if pending.timerId == id then
+            pendingTap[rowId] = nil
+            queueAction(pending.singleAction)
+            return
+        end
+    end
+end)
+
+local stockTab = tabs:newTab("Stock")
+
+local stockSearch = stockTab:addInput({
+    x = 1, y = 2,
+    width = "{parent.width}",
+    placeholder = "search...",
+    background = colors.gray,
+    foreground = colors.white,
+    placeholderColor = colors.lightGray,
+})
+
+local stockFrame = stockTab:addFrame({
+    x = 1, y = 4,
+    width = "{parent.width}",
+    height = "{parent.height - 5}",
+    background = colors.black,
+})
+
+local pageLabel = stockTab:addLabel({
+    x = 1, y = "{parent.height - 1}",
+    width = "{parent.width - 16}",
+    text = "",
+    foreground = colors.lightGray,
+    background = colors.black,
+})
+
+local prevBtn = stockTab:addButton({
+    x = "{parent.width - 15}", y = "{parent.height - 1}",
+    width = 7, height = 1,
+    text = "< Prev",
+    background = colors.gray,
+})
+
+local nextBtn = stockTab:addButton({
+    x = "{parent.width - 7}", y = "{parent.height - 1}",
+    width = 7, height = 1,
+    text = "Next >",
+    background = colors.gray,
+})
+
+local allStock = {}
+local filteredStock = {}
+local stockPage = 1
+local stockRowLabels = {}
+local STOCK_ROWS_PER_PAGE = 10
+local sortMode = "name" -- "name", "count_desc", "count_asc"
+
+local function applySortToStock(items)
+    local sorted = {}
+    for _, v in ipairs(items) do table.insert(sorted, v) end
+    if sortMode == "count_desc" then
+        table.sort(sorted, function(a, b) return a.count > b.count end)
+    elseif sortMode == "count_asc" then
+        table.sort(sorted, function(a, b) return a.count < b.count end)
+    end
+    return sorted
+end
+
+for i = 1, STOCK_ROWS_PER_PAGE do
+    local rowFrame = stockFrame:addFrame({
+        x = 1, y = i,
+        width = "{parent.width}",
+        height = 1,
+        background = colors.black,
+    })
+
+    local nameLabel = rowFrame:addLabel({
+        x = 1, y = 1,
+        width = "{parent.width - 6}",
+        text = "",
+        foreground = colors.white,
+        background = colors.black,
+    })
+    local countLabel = rowFrame:addLabel({
+        x = "{parent.width - 5}", y = 1,
+        width = 6,
+        text = "",
+        foreground = colors.cyan,
+        background = colors.black,
+    })
+    stockRowLabels[i] = { name = nameLabel, count = countLabel, item = nil }
+
+    rowFrame:onClick(function()
+        local row = stockRowLabels[i]
+        if not row.item then return end
+        local key = row.item.name .. "|" .. tostring(row.item.nbt or "")
+        local item = row.item
+        handleTap(
+            "stock_row_" .. i,
+            key,
+            function() end, -- single tap on a stock row does nothing
+            function()
+                local shortName = item.displayName or (item.name:match(":(.+)$") or item.name)
+                showDetailPopup(item.name, item.nbt, shortName)
+            end
+        )
+    end)
+end
+
+local function renderStockPage()
+    local totalPages = math.max(1, math.ceil(#filteredStock / STOCK_ROWS_PER_PAGE))
+    if stockPage > totalPages then stockPage = totalPages end
+    if stockPage < 1 then stockPage = 1 end
+
+    local startIdx = (stockPage - 1) * STOCK_ROWS_PER_PAGE + 1
+
+    for i = 1, STOCK_ROWS_PER_PAGE do
+        local item = filteredStock[startIdx + i - 1]
+        local row = stockRowLabels[i]
+        row.item = item
+        if item then
+            local shortName = item.displayName or (item.name:match(":(.+)$") or item.name)
+            row.name:setText(shortName)
+            row.count:setText("x" .. item.count)
+        else
+            row.name:setText("")
+            row.count:setText("")
+        end
+    end
+
+    if #filteredStock == 0 then
+        stockRowLabels[1].name:setText("(no items found)")
+        stockRowLabels[1].count:setText("")
+        pageLabel:setText("")
+    else
+        pageLabel:setText("Page " .. stockPage .. "/" .. totalPages .. "  (" .. #filteredStock .. " items)")
+    end
+end
+
+local function renderStock(filterText)
+    filterText = (filterText or ""):lower()
+    local matched = {}
+    for _, item in ipairs(allStock) do
+        local shortName = item.displayName or (item.name:match(":(.+)$") or item.name)
+        if filterText == "" or shortName:lower():find(filterText, 1, true) or item.name:lower():find(filterText, 1, true) then
+            table.insert(matched, item)
+        end
+    end
+    filteredStock = applySortToStock(matched)
+    stockPage = 1
+    renderStockPage()
+end
+
+local function refreshStock()
+    setMessage("Loading stock...", colors.yellow)
+    local resp = send({ cmd = "stock" })
+    if not resp then
+        setConnected(false)
+        setMessage("No response from server.", colors.red)
+        return
+    end
+    setConnected(true)
+    if not resp.ok then
+        setMessage(resp.err or "Unknown error.", colors.red)
+        return
+    end
+    allStock = resp.stock or {}
+    renderStock(stockSearch:getText())
+    setMessage("Stock loaded (" .. #allStock .. " items).", colors.lime)
+end
+
+stockSearch:onChange("text", function(self, value)
+    renderStock(value)
+end)
+
+prevBtn:onClick(function()
+    stockPage = stockPage - 1
+    renderStockPage()
+end)
+
+nextBtn:onClick(function()
+    stockPage = stockPage + 1
+    renderStockPage()
+end)
+
+local sortBtn = stockTab:addButton({
+    x = 1, y = 1,
+    width = 8, height = 1,
+    text = "Sort:Name",
+    background = colors.gray,
+})
+sortBtn:onClick(function()
+    if sortMode == "name" then
+        sortMode = "count_desc"
+        sortBtn:setText("Sort:Hi ")
+    elseif sortMode == "count_desc" then
+        sortMode = "count_asc"
+        sortBtn:setText("Sort:Lo ")
+    else
+        sortMode = "name"
+        sortBtn:setText("Sort:Name")
+    end
+    renderStock(stockSearch:getText())
+end)
+
+local refreshBtn = stockTab:addButton({
+    x = "{parent.width - 8}", y = 1,
+    width = 8, height = 1,
+    text = "Refresh",
+    background = colors.blue,
+})
+refreshBtn:onClick(function()
+    refreshStock()
+end)
+
+local depositTab = tabs:newTab("Deposit")
+
+depositTab:addLabel({ x = 1, y = 1, text = "Item (blank = hand):", foreground = colors.white })
+local depositItemInput = depositTab:addInput({
+    x = 1, y = 2,
+    width = "{parent.width}",
+    placeholder = "e.g. diamond",
+    background = colors.gray,
+    foreground = colors.white,
+    placeholderColor = colors.lightGray,
+})
+
+depositTab:addLabel({ x = 1, y = 4, text = "Count:", foreground = colors.white })
+local depositCountInput = depositTab:addInput({
+    x = 1, y = 5,
+    width = "{parent.width}",
+    placeholder = "number, 'all', or 'alloftype'",
+    background = colors.gray,
+    foreground = colors.white,
+    placeholderColor = colors.lightGray,
+})
+
+local function doDeposit()
+    local itemText = depositItemInput:getText()
+    local countText = depositCountInput:getText()
+    countText = (countText == "" and "all") or countText
+
+    setMessage("Depositing...", colors.yellow)
+
+    local resp
+    if itemText == "" or itemText:lower() == "hand" then
+        local count
+        if countText:lower() == "all" then
+            count = 0
+        elseif countText:lower() == "alloftype" then
+            count = "alloftype"
+        else
+            count = tonumber(countText)
+        end
+        if count == nil then
+            setMessage("Invalid count.", colors.red)
+            return
+        end
+        resp = send({ cmd = "deposit_hand", count = count })
+    else
+        local count = (countText:lower() == "all") and 0 or tonumber(countText)
+        if count == nil then
+            setMessage("Invalid count.", colors.red)
+            return
+        end
+        resp = send({ cmd = "deposit", item = itemText, count = count })
+    end
+
+    if not resp then
+        setConnected(false)
+        setMessage("No response from server.", colors.red)
+    elseif resp.ok then
+        setConnected(true)
+        setMessage(resp.msg, colors.lime)
+        depositItemInput:setText("")
+        depositCountInput:setText("")
+    else
+        setConnected(true)
+        setMessage(resp.err, colors.red)
+    end
+end
+
+depositTab:addButton({
+    x = 1, y = 7,
+    width = "{parent.width}",
+    height = 3,
+    text = "Deposit",
+    background = colors.green,
+}):onClick(function()
+    doDeposit()
+end)
+
+depositTab:addButton({
+    x = 1, y = 11,
+    width = "{parent.width}",
+    height = 1,
+    text = "Quick: Deposit Hand (All)",
+    background = colors.gray,
+}):onClick(function()
+    setMessage("Depositing hand...", colors.yellow)
+    local resp = send({ cmd = "deposit_hand", count = 0 })
+    if not resp then
+        setConnected(false)
+        setMessage("No response from server.", colors.red)
+    elseif resp.ok then
+        setConnected(true)
+        setMessage(resp.msg, colors.lime)
+    else
+        setConnected(true)
+        setMessage(resp.err, colors.red)
+    end
+end)
+
+local requestTab = tabs:newTab("Request")
+
+requestTab:addLabel({ x = 1, y = 1, text = "Item:", foreground = colors.white })
+local requestItemInput = requestTab:addInput({
+    x = 1, y = 2,
+    width = "{parent.width}",
+    placeholder = "e.g. diamond, iron_ingot",
+    background = colors.gray,
+    foreground = colors.white,
+    placeholderColor = colors.lightGray,
+})
+
+requestTab:addLabel({ x = 1, y = 4, text = "Count:", foreground = colors.white })
+local requestCountInput = requestTab:addInput({
+    x = 1, y = 5,
+    width = "{parent.width}",
+    placeholder = "number or 'all'",
+    background = colors.gray,
+    foreground = colors.white,
+    placeholderColor = colors.lightGray,
+})
+
+local MAX_VARIANT_ROWS = 6
+local variantButtons = {}
+for i = 1, MAX_VARIANT_ROWS do
+    local btn = requestTab:addButton({
+        x = 1, y = 6 + i,
+        width = "{parent.width}",
+        height = 1,
+        text = "",
+        background = colors.gray,
+    })
+    btn:setVisible(false)
+    variantButtons[i] = btn
+end
+
+local currentVariants = nil
+local currentVariantItem = nil
+
+local function hideVariantButtons()
+    for _, btn in ipairs(variantButtons) do
+        btn:setVisible(false)
+    end
+end
+
+local function selectVariant(index)
+    if not currentVariants or not currentVariants[index] then return end
+    local countText = requestCountInput:getText()
+    if countText == "" then
+        setMessage("Enter a count or 'all' first.", colors.red)
+        return
+    end
+    local count = (countText:lower() == "all") and "all" or tonumber(countText)
+    if count == nil then
+        setMessage("Invalid count.", colors.red)
+        return
+    end
+    local chosen = currentVariants[index]
+
+    setMessage("Requesting variant...", colors.yellow)
+    local resp = send({
+        cmd = "request",
+        item = currentVariantItem,
+        count = count,
+        nbt = chosen.nbt,
+    })
+    if not resp then
+        setConnected(false)
+        setMessage("No response from server.", colors.red)
+    elseif resp.ok then
+        setConnected(true)
+        setMessage(resp.msg, colors.lime)
+        hideVariantButtons()
+        requestItemInput:setText("")
+        requestCountInput:setText("")
+    else
+        setConnected(true)
+        setMessage(resp.err, colors.red)
+    end
+end
+
+local function doRequest()
+    local itemText = requestItemInput:getText()
+    local countText = requestCountInput:getText()
+
+    if itemText == "" then
+        setMessage("Enter an item name.", colors.red)
+        return
+    end
+    if countText == "" then
+        setMessage("Enter a count or 'all'.", colors.red)
+        return
+    end
+
+    local count = (countText:lower() == "all") and "all" or tonumber(countText)
+    if count == nil then
+        setMessage("Invalid count.", colors.red)
+        return
+    end
+
+    if itemText:find(",") then
+        setMessage("Requesting multiple items...", colors.yellow)
+        local resp = send({ cmd = "request_multi", items = itemText, count = count })
+        if not resp then
+            setConnected(false)
+            setMessage("No response from server.", colors.red)
+        elseif resp.ok then
+            setConnected(true)
+            setMessage(resp.msg or "Done.", colors.lime)
+            requestItemInput:setText("")
+            requestCountInput:setText("")
+        else
+            setConnected(true)
+            setMessage(resp.err or "Failed.", colors.red)
+        end
+        return
+    end
+
+    setMessage("Checking item...", colors.yellow)
+    local varResp = send({ cmd = "variants", item = itemText })
+
+    if varResp and varResp.ok and varResp.variants and #varResp.variants > 1 then
+        currentVariants = varResp.variants
+        currentVariantItem = itemText
+        hideVariantButtons()
+        for i, v in ipairs(currentVariants) do
+            if i <= MAX_VARIANT_ROWS then
+                local label = (v.enchants or "Plain") .. "  x" .. v.count
+                if #label > 30 then label = label:sub(1, 29) .. "~" end
+                variantButtons[i]:setText(label)
+                variantButtons[i]:setVisible(true)
+            end
+        end
+        setMessage("Multiple variants - tap one below:", colors.yellow)
+        return
+    end
+
+    hideVariantButtons()
+    local resp = send({ cmd = "request", item = itemText, count = count })
+    if not resp then
+        setConnected(false)
+        setMessage("No response from server.", colors.red)
+    elseif resp.ok then
+        setConnected(true)
+        setMessage(resp.msg, colors.lime)
+        requestItemInput:setText("")
+        requestCountInput:setText("")
+    else
+        setConnected(true)
+        setMessage(resp.err, colors.red)
+    end
+end
+
+for i, btn in ipairs(variantButtons) do
+    btn:onClick(function()
+        if not currentVariants or not currentVariants[i] then return end
+        local chosen = currentVariants[i]
+        local itemName = currentVariantItem
+        local key = itemName .. "|" .. tostring(chosen.nbt or "")
+        handleTap(
+            "variant_row_" .. i,
+            key,
+            function() selectVariant(i) end,
+            function()
+                local label = chosen.enchants or itemName
+                showDetailPopup(itemName, chosen.nbt, label)
+            end
+        )
+    end)
+end
+
+requestTab:addButton({
+    x = 1, y = "{parent.height - 2}",
+    width = "{parent.width}",
+    height = 3,
+    text = "Request",
+    background = colors.green,
+}):onClick(function()
+    doRequest()
+end)
+
+local function startupRoutine()
+    sleep(0.5) -- let Basalt's first render pass complete
+
+    local connId = findServer()
+    if connId then
+        serverId = connId
+        setConnected(true)
+        setMessage("Connected to server.", colors.lime)
+        refreshStock()
+    else
+        setConnected(false)
+        setMessage("Server not found. Use Stock > Refresh to retry.", colors.red)
+    end
+
+    while true do
+        if #actionQueue > 0 then
+            local fn = table.remove(actionQueue, 1)
+            local ok, err = pcall(fn)
+            if not ok then
+                setMessage("Error: " .. tostring(err), colors.red)
+            end
+        else
+            sleep(0.1)
+        end
+    end
+end
+
+parallel.waitForAny(
+    function() basalt.run() end,
+    startupRoutine
+)
